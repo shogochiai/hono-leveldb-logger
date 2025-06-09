@@ -1,0 +1,147 @@
+version: '3.8'
+
+services:
+  # メインのログサービス
+  hono-logger:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: hono-leveldb-logger
+    ports:
+      - "3000:3000"
+      - "3443:3443"  # HTTPS/mTLS用
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - HTTPS_PORT=3443
+      - LOG_LEVEL=info
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-default-key-for-development-only}
+      - JWT_SECRET=${JWT_SECRET:-your-jwt-secret-change-in-production}
+      - JWT_ISSUER=${JWT_ISSUER:-hono-leveldb-logger}
+      - JWT_AUDIENCE=${JWT_AUDIENCE:-hono-leveldb-logger}
+      - JWT_EXPIRATION=${JWT_EXPIRATION:-1h}
+      - API_KEY_SECRET=${API_KEY_SECRET:-your-api-key-secret-change-in-production}
+      - NONCE_WINDOW_MS=${NONCE_WINDOW_MS:-300000}
+      - CACHE_EXPIRATION_MS=${CACHE_EXPIRATION_MS:-300000}
+      - RATE_LIMIT_PER_MINUTE=${RATE_LIMIT_PER_MINUTE:-1000}
+      - ENABLE_MTLS=${ENABLE_MTLS:-false}
+      - TLS_CERT_PATH=${TLS_CERT_PATH}
+      - TLS_KEY_PATH=${TLS_KEY_PATH}
+      - TLS_CA_PATH=${TLS_CA_PATH}
+    volumes:
+      - ./data:/app/data
+      - ./certs:/app/certs:ro
+    networks:
+      - logger-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Redis（キャッシュとレート制限用）
+  redis:
+    image: redis:7-alpine
+    container_name: hono-logger-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - logger-network
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Consul（サービスディスカバリ用）
+  consul:
+    image: consul:1.16
+    container_name: hono-logger-consul
+    ports:
+      - "8500:8500"
+      - "8600:8600/udp"
+    volumes:
+      - consul-data:/consul/data
+    networks:
+      - logger-network
+    restart: unless-stopped
+    command: >
+      consul agent -server -bootstrap-expect=1 -ui -bind=0.0.0.0 
+      -client=0.0.0.0 -data-dir=/consul/data
+    healthcheck:
+      test: ["CMD", "consul", "members"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Prometheus（メトリクス収集用）
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: hono-logger-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    networks:
+      - logger-network
+    restart: unless-stopped
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+
+  # Grafana（メトリクス可視化用）
+  grafana:
+    image: grafana/grafana:latest
+    container_name: hono-logger-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./docker/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./docker/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    networks:
+      - logger-network
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
+  # Nginx（リバースプロキシとロードバランサー）
+  nginx:
+    image: nginx:alpine
+    container_name: hono-logger-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    networks:
+      - logger-network
+    restart: unless-stopped
+    depends_on:
+      - hono-logger
+
+volumes:
+  redis-data:
+  consul-data:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  logger-network:
+    driver: bridge
+
